@@ -1,0 +1,5 @@
+data/test/
+data/train/
+data/dataset_dict.json
+__pycache__
+pg.ipynb
