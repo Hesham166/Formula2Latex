@@ -21,6 +21,9 @@ class UniMERDataset(Dataset):
         self.tokenizer = tokenizer
         self.stage = stage
         self.max_seq_len = max_seq_len
+        
+        self.bos_id = tokenizer.bos_token_id
+        self.eos_id = tokenizer.eos_token_id
 
         if stage == "train":
             self.transform = get_train_transforms(image_size)
@@ -34,19 +37,26 @@ class UniMERDataset(Dataset):
 
     def __getitem__(self, idx: int):
         item = self.dataset[idx]
-        image = item['image']
-        pixel_values = self.transform(image)
+        pixel_values = self.transform(item['image'])
         text = item['text']
 
+        # Encode with space reserved for BOS/EOS
         input_ids = self.tokenizer.encode(
             text,
-            max_length=self.max_seq_len,
+            max_length=self.max_seq_len - 2,  # Reserve space
             truncation=True,
             add_special_tokens=False
         )
 
-        if not input_ids or input_ids[-1] != self.tokenizer.eos_token_id:
-            input_ids.append(self.tokenizer.eos_token_id)
+        needs_bos = not input_ids or input_ids[0] != self.bos_id
+        needs_eos = not input_ids or input_ids[-1] != self.eos_id
+        
+        if needs_bos and needs_eos:
+            input_ids = [self.bos_id] + input_ids + [self.eos_id]
+        elif needs_bos:
+            input_ids = [self.bos_id] + input_ids
+        elif needs_eos:
+            input_ids.append(self.eos_id)
 
         return {
             "pixel_values": pixel_values,
@@ -85,9 +95,6 @@ def get_dataloader(
     stage: str = 'train',
     shuffle: bool = True
 ):
-    """
-    Helper to create dataloader from ExperimentConfig
-    """
     tokenizer_file = os.path.join(config.model.tokenizer_path, "tokenizer.json")
     tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_file)
     
@@ -111,12 +118,15 @@ def get_dataloader(
     collator = UniMERCollator(pad_token_id=tokenizer.pad_token_id)
     
     batch_size = config.training.batch_size_train if stage == 'train' else config.training.batch_size_eval
+    num_workers = config.training.num_workers
     
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
-        num_workers=config.training.num_workers,
+        num_workers=num_workers,
         collate_fn=collator,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=4 if num_workers > 0 else None,
     )
