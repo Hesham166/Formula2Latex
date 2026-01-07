@@ -192,7 +192,7 @@ class Stage(nn.Module):
         
         return x, (H, W)
 
-class UnimerNetEncoder(nn.Module):
+class UniMERNetEncoder(nn.Module):
     def __init__(
         self,
         depths: List[int],
