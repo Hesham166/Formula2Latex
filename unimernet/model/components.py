@@ -4,50 +4,54 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 
 
+class LayerNorm2d(nn.GroupNorm):
+    """Layer Normalization for 2D inputs."""
+    
+    def __init__(self, num_channels: int, eps: float = 1e-6):
+        super().__init__(num_channels, num_channels, eps=eps)
+
+
 class FineGrainedEmbedding(nn.Module):
-    """FGE replaces the standard non-overlapping patch embedding with overlapping convolution."""
+    """Overlapping convolutional patch embedding with 4x downsampling."""
 
-    def __init__(self, in_channels: int = 3, embedding_dim: int = 96, norm_layer: str = "BN"):
+    def __init__(self, in_channels: int = 3, embedding_dim: int = 96, norm_layer: str = "LN"):
         super().__init__()
+        hidden_dim = embedding_dim // 2
         
-        self.conv1 = nn.Conv2d(in_channels, embedding_dim // 2, kernel_size=3, stride=2, padding=1)
-
+        self.conv1 = nn.Conv2d(in_channels, hidden_dim, kernel_size=3, stride=2, padding=1)
+        self.conv2 = nn.Conv2d(hidden_dim, embedding_dim, kernel_size=3, stride=2, padding=1)
+        
         if norm_layer == "BN":
-            self.norm = nn.BatchNorm2d(embedding_dim // 2)
+            self.norm1 = nn.BatchNorm2d(hidden_dim)
+        elif norm_layer == "LN":
+            self.norm1 = LayerNorm2d(hidden_dim)
         else:
-            raise NotImplementedError(f"{norm_layer} is not supported")
-
+            raise NotImplementedError(f"norm_layer '{norm_layer}' not supported")
+        
         self.act = nn.GELU()
-        self.conv2 = nn.Conv2d(embedding_dim // 2, embedding_dim, kernel_size=3, stride=2, padding=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.conv1(x)
-        x = self.norm(x)
+        x = self.norm1(x)
         x = self.act(x)
         x = self.conv2(x)
         return x
 
 
 class ConvEnhance(nn.Module):
-    """CE uses depthwise convolution with residual connection and GELU activation to enhance local context."""
+    """Depthwise convolution with residual connection for local feature enhancement."""
 
-    def __init__(self, dim: int, hidden_act: str = "gelu", kernel_size: int = 3):
+    def __init__(self, dim: int, kernel_size: int = 3):
         super().__init__()
-        
         self.conv = nn.Conv2d(dim, dim, kernel_size=kernel_size, padding=kernel_size // 2, groups=dim)
-        
-        if hidden_act == "gelu":
-            self.act = nn.GELU()
-        else:
-            raise NotImplementedError(f"{hidden_act} is not supported")
-        
+        self.act = nn.GELU()
+
     def forward(self, x: torch.Tensor, size: Tuple[int, int]) -> torch.Tensor:
         B, N, C = x.shape
         H, W = size
-        assert N == H * W, f"Token count {N} does not match image size {H} x {W} = {H * W}"
-
-        feat = x.transpose(1, 2).view(B, C, H, W)
+        assert N == H * W, f"Token count {N} doesn't match spatial size {H}x{W}"
         
+        feat = x.transpose(1, 2).reshape(B, C, H, W)
         feat = self.conv(feat)
         feat = self.act(feat)
         feat = feat.flatten(2).transpose(1, 2)
@@ -56,10 +60,19 @@ class ConvEnhance(nn.Module):
 
 
 class SqueezeAttention(nn.Module):
-    """SA maps Query and Key to a lower dimension space to accelerate inference."""
+    """Efficient attention with squeezed Q/K projections."""
 
-    def __init__(self, embed_dim: int, num_heads: int = 8, qk_squeeze: int = 2, dropout: float = 0.0, bias: bool = True, is_decoder: bool = False):
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int = 8,
+        qk_squeeze: int = 2,
+        dropout: float = 0.0,
+        bias: bool = True,
+        is_decoder: bool = False
+    ):
         super().__init__()
+        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
         
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -69,84 +82,82 @@ class SqueezeAttention(nn.Module):
         self.head_dim = embed_dim // num_heads
         self.squeeze_dim = embed_dim // qk_squeeze
         self.squeeze_head_dim = self.squeeze_dim // num_heads
-
-        self.scaling = self.squeeze_head_dim ** -0.5
         
         self.q_proj = nn.Linear(embed_dim, self.squeeze_dim, bias=bias)
         self.k_proj = nn.Linear(embed_dim, self.squeeze_dim, bias=bias)
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-
         self.dropout = nn.Dropout(dropout)
 
-    def _shape_qk(self, x: torch.Tensor, seq_len: int, batch_size: int) -> torch.Tensor:
-        return x.view(batch_size, seq_len, self.num_heads, self.squeeze_head_dim).transpose(1, 2).contiguous()
-
-    def _shape_v(self, x: torch.Tensor, seq_len: int, batch_size: int) -> torch.Tensor:
-        return x.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+    def _shape(self, x: torch.Tensor, dim_head: int, bsz: int) -> torch.Tensor:
+        return x.view(bsz, -1, self.num_heads, dim_head).transpose(1, 2)
 
     def forward(
-        self, 
-        hidden_states: torch.Tensor, 
-        key_value_states: Optional[torch.Tensor] = None, 
-        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, 
+        self,
+        hidden_states: torch.Tensor,
+        key_value_states: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        
         batch_size, tgt_len, _ = hidden_states.shape
         is_cross_attention = key_value_states is not None
 
-        if is_cross_attention and past_key_value is not None:
-            key_states = past_key_value[0]
-            value_states = past_key_value[1]
-        elif is_cross_attention:
-            key_states = self._shape_qk(self.k_proj(key_value_states), -1, batch_size)
-            value_states = self._shape_v(self.v_proj(key_value_states), -1, batch_size)
-        elif past_key_value is not None:
-            key_states = self._shape_qk(self.k_proj(hidden_states), -1, batch_size)
-            value_states = self._shape_v(self.v_proj(hidden_states), -1, batch_size)
-            
+        if is_cross_attention:
+            k_in = key_value_states
+            v_in = key_value_states
+        else:
+            k_in = hidden_states
+            v_in = hidden_states
+
+        key_states = self._shape(self.k_proj(k_in), self.squeeze_head_dim, batch_size)
+        value_states = self._shape(self.v_proj(v_in), self.head_dim, batch_size)
+
+        if past_key_value is not None:
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
-        else:
-            key_states = self._shape_qk(self.k_proj(hidden_states), -1, batch_size)
-            value_states = self._shape_v(self.v_proj(hidden_states), -1, batch_size)
 
-        query_states = self._shape_qk(self.q_proj(hidden_states) * self.scaling, -1, batch_size)
-
-        attn_weights = torch.matmul(query_states, key_states.transpose(-1, -2))
-
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-
+        query_states = self._shape(self.q_proj(hidden_states), self.squeeze_head_dim, batch_size)
         
-        out = torch.matmul(attn_weights, value_states)
-        out = out.transpose(1, 2).contiguous().view(batch_size, -1, self.embed_dim)
-        out = self.out_proj(out)
-        
-        if self.is_decoder:
-            past_key_value = (key_states, value_states)
-        else:
-            past_key_value = None
+        attn_output = F.scaled_dot_product_attention(
+            query_states, 
+            key_states, 
+            value_states,
+            attn_mask=attention_mask,
+            dropout_p=self.dropout.p if self.training else 0.0
+        )
 
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, -1, self.embed_dim)
+        out = self.out_proj(attn_output)
+        
+        past_key_value = (key_states, value_states) if self.is_decoder else None
         return out, past_key_value
 
 
 class WindowAttention(nn.Module):
-    """Standard Window Attention without shifting."""
+    """Window-based multi-head self-attention with relative position bias."""
 
-    def __init__(self, dim: int, window_size: int, num_heads: int, qkv_bias: bool = True, attn_drop: float = 0.0, proj_drop: float = 0.0):
+    def __init__(
+        self,
+        dim: int,
+        window_size: int,
+        num_heads: int,
+        qkv_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0
+    ):
         super().__init__()
+        assert dim % num_heads == 0, "dim must be divisible by num_heads"
         
         self.dim = dim
-        self.window_size = window_size
+        self.window_size = (window_size, window_size)
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
 
-        self.relative_position_bias_table = nn.Parameter(torch.zeros((2 * window_size - 1) * (2 * window_size - 1), num_heads))
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * self.window_size[0] - 1) * (2 * self.window_size[1] - 1), num_heads)
+        )
+        nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
         
         coords_h = torch.arange(self.window_size[0])
         coords_w = torch.arange(self.window_size[1])
@@ -166,27 +177,30 @@ class WindowAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        B_, N, C = x.shape
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
 
-        q = q * self.scale
-        attn = (q @ k.transpose(-2, -1))
-
-        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
-            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)
-        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
-        attn = attn + relative_position_bias.unsqueeze(0)
-
+        relative_position_bias = self.relative_position_bias_table[
+            self.relative_position_index.view(-1)
+        ].view(
+            self.window_size[0] * self.window_size[1],
+            self.window_size[0] * self.window_size[1],
+            -1
+        )
+        
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous().unsqueeze(0)
         if mask is not None:
             nW = mask.shape[0]
-            attn = attn.view(B // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, N, N)
-            attn = self.attn_drop(F.softmax(attn, dim=-1))
-        else:
-            attn = self.attn_drop(F.softmax(attn, dim=-1))
+            pass
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=relative_position_bias,
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+        )
+
+        x = x.transpose(1, 2).reshape(B_, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -197,6 +211,7 @@ def window_partition(x: torch.Tensor, window_size: int) -> torch.Tensor:
     x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
     windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
     return windows
+
 
 def window_reverse(windows: torch.Tensor, window_size: int, H: int, W: int) -> torch.Tensor:
     B = int(windows.shape[0] / (H * W / window_size / window_size))
